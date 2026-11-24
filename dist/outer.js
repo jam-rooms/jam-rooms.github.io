@@ -312,30 +312,6 @@
     await runner.run({ section: "S0", id: "s0-worker", expect: "record" }, 15000, async () => workerEnv(frame));
   };
 
-  // src/shared/concurrency.ts
-  var mapWithConcurrency = async (items, limit, run) => {
-    const results = new Array(items.length);
-    let cursor = 0;
-    const worker = async () => {
-      while (true) {
-        const index = cursor;
-        cursor += 1;
-        if (index >= items.length)
-          return;
-        const item = items[index];
-        if (item === undefined)
-          return;
-        results[index] = await run(item, index);
-      }
-    };
-    const width = Math.max(1, Math.min(limit, items.length));
-    const workers = [];
-    for (let index = 0;index < width; index += 1)
-      workers.push(worker());
-    await Promise.all(workers);
-    return results;
-  };
-
   // src/shared/http.ts
   var fetchResource = async (url) => {
     const started = performance.now();
@@ -352,10 +328,10 @@
     };
   };
   var decodeText = (buffer) => new TextDecoder().decode(buffer);
-  var sha256Hex = async (buffer) => {
+  var sha256Hex = async (source) => {
     if (crypto.subtle === undefined)
       throw new Error("crypto.subtle が無い");
-    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    const digest = await crypto.subtle.digest("SHA-256", source);
     return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   };
   var urlInRoom = (baseUrl, path) => new URL(path, baseUrl).href;
@@ -423,6 +399,56 @@
       return;
     return { format: 1, entry: record2.entry, modules, lib };
   };
+
+  // src/shared/concurrency.ts
+  var mapWithConcurrency = async (items, limit, run) => {
+    const results = new Array(items.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= items.length)
+          return;
+        const item = items[index];
+        if (item === undefined)
+          return;
+        results[index] = await run(item, index);
+      }
+    };
+    const width = Math.max(1, Math.min(limit, items.length));
+    const workers = [];
+    for (let index = 0;index < width; index += 1)
+      workers.push(worker());
+    await Promise.all(workers);
+    return results;
+  };
+
+  // src/shared/room-load.ts
+  var loadEntries = async (baseUrl, entries, limit) => await mapWithConcurrency(entries, limit, async (entry) => {
+    try {
+      const fetched = await fetchResource(urlInRoom(baseUrl, entry.path));
+      const hash = await sha256Hex(fetched.buffer);
+      return {
+        entry,
+        status: fetched.status,
+        bytes: fetched.bytes,
+        hash,
+        text: decodeText(fetched.buffer)
+      };
+    } catch (error) {
+      return { entry, status: 0, bytes: 0, hash: "", error: describeError(error) };
+    }
+  });
+  var sourcesOf = (loaded) => {
+    const sources = [];
+    for (const item of loaded) {
+      if (item.text !== undefined)
+        sources.push({ name: item.entry.name, source: item.text });
+    }
+    return sources;
+  };
+  var mismatchedOf = (loaded) => loaded.filter((item) => item.status !== 200 || item.hash !== item.entry.sha256);
 
   // src/outer/bulk.ts
   var EXPECTED_COUNT = 500;
@@ -502,29 +528,6 @@
   };
 
   // src/outer/s1.ts
-  var loadEntries = async (baseUrl, entries, limit) => await mapWithConcurrency(entries, limit, async (entry) => {
-    try {
-      const fetched = await fetchResource(urlInRoom(baseUrl, entry.path));
-      const hash = await sha256Hex(fetched.buffer);
-      return {
-        entry,
-        status: fetched.status,
-        bytes: fetched.bytes,
-        hash,
-        text: decodeText(fetched.buffer)
-      };
-    } catch (error) {
-      return { entry, status: 0, bytes: 0, hash: "", error: describeError(error) };
-    }
-  });
-  var sourcesOf = (loaded) => {
-    const sources = [];
-    for (const item of loaded) {
-      if (item.text !== undefined)
-        sources.push({ name: item.entry.name, source: item.text });
-    }
-    return sources;
-  };
   var summarize = (loaded, mismatched, elapsedMs) => {
     const totalBytes = loaded.reduce((sum, item) => sum + item.bytes, 0);
     const bad = mismatched.map((item) => item.entry.name).join(",");
@@ -586,7 +589,7 @@
         try {
           started = performance.now();
           const loaded = await loadEntries(room.baseUrl, current.modules, 6);
-          const mismatched = loaded.filter((item) => item.status !== 200 || item.hash !== item.entry.sha256);
+          const mismatched = mismatchedOf(loaded);
           modulesMatched = loaded.length - mismatched.length;
           modules = sourcesOf(loaded);
           return {
@@ -604,7 +607,7 @@
         const started = performance.now();
         try {
           const loaded = await loadEntries(room.baseUrl, current.lib, 3);
-          const mismatched = loaded.filter((item) => item.status !== 200 || item.hash !== item.entry.sha256);
+          const mismatched = mismatchedOf(loaded);
           libMatched = loaded.length - mismatched.length;
           libThree = loaded.find((item) => item.entry.name === "three" && item.text !== undefined)?.text;
           const three = loaded.find((item) => item.entry.name === "three");

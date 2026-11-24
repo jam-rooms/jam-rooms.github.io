@@ -609,6 +609,479 @@ const run = async () => {
     }
   };
 
+  // src/frame/workers/preview.ts
+  var PREVIEW_WORKER_SOURCE = `${LOCK_CODE}
+const DRAW_MS = 5000;
+const post = (message) => self.postMessage(message);
+const cut = (text, limit) => (text.length > limit ? text.slice(0, limit) + "…" : text);
+
+/** describe() の戻り値を、循環や関数を避けながら文字にする。 */
+const textOf = (value) => {
+  const seen = new WeakSet();
+  try {
+    const text = JSON.stringify(
+      value,
+      (key, item) => {
+        if (typeof item === "function") return "[関数]";
+        if (typeof item === "bigint") return String(item) + "n";
+        if (typeof item === "object" && item !== null) {
+          if (seen.has(item)) return "[循環]";
+          seen.add(item);
+        }
+        return item;
+      },
+      2
+    );
+    return text === undefined ? String(value) : text;
+  } catch (error) {
+    return describe(error);
+  }
+};
+
+const runDraw = (drawFn, canvas) => {
+  if (!canvas || typeof canvas.getContext !== "function") {
+    post({ type: "preview-unsupported", detail: "この環境では描けません（Worker にキャンバスを渡せません）" });
+    return;
+  }
+  const context = canvas.getContext("2d");
+  if (!context) {
+    post({ type: "preview-unsupported", detail: "この環境では描けません（Worker の中に 2D コンテキストが無い）" });
+    return;
+  }
+  const width = canvas.width;
+  const height = canvas.height;
+  const startedAt = performance.now();
+  let frames = 0;
+  const loop = () => {
+    const seconds = (performance.now() - startedAt) / 1000;
+    try {
+      drawFn(context, seconds, width, height);
+    } catch (error) {
+      post({ type: "preview-error", phase: "draw", detail: cut(describe(error), 300) });
+      return;
+    }
+    frames += 1;
+    post({ type: "preview-tick", frames: frames });
+    if (performance.now() - startedAt < DRAW_MS) {
+      setTimeout(loop, 16);
+    } else {
+      post({ type: "preview-frames", frames: frames });
+    }
+  };
+  loop();
+};
+
+const run = async (data) => {
+  const urls = data.urls && typeof data.urls === "object" ? data.urls : {};
+  const entryUrl = urls[data.entry];
+  if (typeof entryUrl !== "string") {
+    post({ type: "preview-error", phase: "load", detail: "提出されたモジュールの URL がありません" });
+    return;
+  }
+  try {
+    hideEntryPoints();
+  } catch (error) {
+    // 前置きの片付けに失敗しても、読み込みは続ける。外への入口は CSP が塞いでいる。
+  }
+
+  let namespace;
+  try {
+    namespace = await import(entryUrl);
+  } catch (error) {
+    post({ type: "preview-error", phase: "load", detail: cut(describe(error), 300) });
+    return;
+  }
+  post({ type: "preview-loaded" });
+
+  const describeFn = namespace && typeof namespace.describe === "function" ? namespace.describe : null;
+  const drawFn = namespace && typeof namespace.draw === "function" ? namespace.draw : null;
+  post({ type: "preview-info", describe: describeFn !== null, draw: drawFn !== null });
+  if (!describeFn && !drawFn) {
+    post({ type: "preview-nothing" });
+    return;
+  }
+
+  if (describeFn) {
+    let text;
+    try {
+      text = textOf(describeFn());
+    } catch (error) {
+      post({ type: "preview-error", phase: "describe", detail: cut(describe(error), 300) });
+      return;
+    }
+    post({ type: "preview-describe", text: cut(text, 2000) });
+  }
+
+  if (drawFn) {
+    runDraw(drawFn, data.canvas);
+    return;
+  }
+  post({ type: "preview-done" });
+};
+
+let started = false;
+self.onmessage = (event) => {
+  const data = event.data;
+  if (!data || data.type !== "boot" || started) return;
+  started = true;
+  run(data).catch((error) => {
+    post({ type: "preview-error", phase: "internal", detail: cut(describe(error), 300) });
+  });
+};
+`;
+
+  // src/frame/workers/chaos.ts
+  var SPIN_SOURCE = `${LOCK_CODE}
+try {
+  hideEntryPoints();
+  self.postMessage({ type: "spin-started" });
+} catch (error) {
+  self.postMessage({ type: "spin-error", detail: describe(error) });
+}
+for (;;) {}
+`;
+  var ECHO_SOURCE = `${LOCK_CODE}
+try {
+  hideEntryPoints();
+  self.postMessage({ type: "echo-ready", value: 1 + 1 });
+} catch (error) {
+  self.postMessage({ type: "echo-error", detail: describe(error) });
+}
+`;
+  var FLOOD_SOURCE = `${LOCK_CODE}
+try {
+  hideEntryPoints();
+} catch (error) {
+  self.postMessage({ type: "flood-error", detail: describe(error) });
+}
+const chunk = "x".repeat(1024);
+for (let index = 0; index < 20000; index += 1) {
+  self.postMessage({ type: "flood", data: chunk });
+}
+self.postMessage({ type: "flood-done", count: 20000 });
+`;
+
+  // src/frame/jobs/watch.ts
+  var SILENCE_MS = 1000;
+  var WATCH_SILENCE_MS = SILENCE_MS;
+  var ECHO_TIMEOUT_MS = 3000;
+  var FLOOD_WINDOW_MS = 1000;
+  var FLOOD_LIMIT = 1000;
+  var FLOOD_MAX_MS = 1e4;
+  var waitForSilence = (worker, silenceMs, onSilent) => new Promise((resolve) => {
+    let timer;
+    let settled = false;
+    const finish = () => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== undefined)
+        clearTimeout(timer);
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      onSilent();
+      resolve();
+    };
+    const arm = () => {
+      if (settled)
+        return;
+      if (timer !== undefined)
+        clearTimeout(timer);
+      timer = setTimeout(finish, silenceMs);
+    };
+    const onMessage = () => arm();
+    const onError = () => finish();
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    arm();
+  });
+  var spinJob = async () => {
+    const started = performance.now();
+    let terminateMs = 0;
+    const spin = createWorker(SPIN_SOURCE);
+    try {
+      await waitForSilence(spin.worker, SILENCE_MS, () => {
+        terminateMs = round1(performance.now() - started);
+        spin.worker.terminate();
+      });
+    } finally {
+      spin.worker.terminate();
+      URL.revokeObjectURL(spin.url);
+    }
+    const echoStarted = performance.now();
+    const echo = createWorker(ECHO_SOURCE);
+    try {
+      const outcome = await waitForMessage(echo.worker, ["echo-ready"], ECHO_TIMEOUT_MS);
+      const value = outcome.kind === "message" ? outcome.data.value : undefined;
+      return {
+        stopped: terminateMs > 0,
+        terminateMs,
+        silenceMs: SILENCE_MS,
+        echoOk: value === 2,
+        echoValue: typeof value === "number" ? value : null,
+        echoMs: round1(performance.now() - echoStarted)
+      };
+    } finally {
+      echo.worker.terminate();
+      URL.revokeObjectURL(echo.url);
+    }
+  };
+  var floodJob = async () => {
+    const { worker, url } = createWorker(FLOOD_SOURCE);
+    const started = performance.now();
+    const times = [];
+    let received = 0;
+    let reason = "time";
+    let stoppedMs = 0;
+    try {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = (next) => {
+          if (settled)
+            return;
+          settled = true;
+          reason = next;
+          stoppedMs = round1(performance.now() - started);
+          clearTimeout(timer);
+          worker.terminate();
+          resolve();
+        };
+        const timer = setTimeout(() => finish("time"), FLOOD_MAX_MS);
+        worker.addEventListener("message", (event) => {
+          const data = asRecord(event.data);
+          if (data === undefined)
+            return;
+          if (data.type === "flood") {
+            received += 1;
+            const now = performance.now();
+            times.push(now);
+            while (times.length > 0) {
+              const oldest = times[0];
+              if (oldest === undefined || now - oldest < FLOOD_WINDOW_MS)
+                break;
+              times.shift();
+            }
+            if (times.length > FLOOD_LIMIT)
+              finish("limit");
+            return;
+          }
+          if (data.type === "flood-done")
+            finish("done");
+        });
+        worker.addEventListener("error", () => finish("error"));
+      });
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    }
+    return {
+      stopped: reason === "limit",
+      reason,
+      received,
+      limitMs: stoppedMs,
+      windowMs: FLOOD_WINDOW_MS,
+      limit: FLOOD_LIMIT
+    };
+  };
+
+  // src/frame/jobs/preview.ts
+  var SILENCE_MS2 = WATCH_SILENCE_MS;
+  var HARD_LIMIT_MS = 20000;
+  var CANVAS_WIDTH = 320;
+  var CANVAS_HEIGHT = 200;
+  var active;
+  var previousCanvas;
+  var recordOf = (value, limit) => typeof value === "string" ? value.slice(0, limit) : undefined;
+  var previewStopJob = () => {
+    const current = active;
+    if (current === undefined)
+      return { stopped: false };
+    current.stop();
+    return { stopped: true };
+  };
+  var createCanvas = () => {
+    previousCanvas?.remove();
+    const canvas = document.createElement("canvas");
+    canvas.width = CANVAS_WIDTH;
+    canvas.height = CANVAS_HEIGHT;
+    canvas.style.cssText = `width:${String(CANVAS_WIDTH)}px;height:${String(CANVAS_HEIGHT)}px;` + "display:block;margin:8px auto;background:#101820";
+    document.body.append(canvas);
+    previousCanvas = canvas;
+    return canvas;
+  };
+  var transfer = (canvas) => {
+    if (typeof canvas.transferControlToOffscreen !== "function")
+      return null;
+    try {
+      return canvas.transferControlToOffscreen();
+    } catch {
+      return null;
+    }
+  };
+  var previewRunJob = async (params) => {
+    const record = asRecord(params);
+    if (record === undefined)
+      throw new Error("params がオブジェクトでない");
+    const modules = parseModules(record["modules"]);
+    const name = parseEntry(record["name"]);
+    if (modules === undefined || name === undefined)
+      throw new Error("modules か name の形が不正");
+    if (!modules.some((module) => module.name === name)) {
+      throw new Error(`提出されたモジュールが無い: ${name}`);
+    }
+    const order = orderModules(modules);
+    if (order.kind === "cycle")
+      throw new Error(`循環する読み込み: ${order.cycle.join(" → ")}`);
+    const table = buildUrlTable(modules, order.order);
+    const canvas = createCanvas();
+    const offscreen = transfer(canvas);
+    const { worker, url: workerUrl } = createWorker(PREVIEW_WORKER_SOURCE);
+    const started = performance.now();
+    const collected = {
+      status: "ok",
+      describePresent: false,
+      nothing: false,
+      drawPresent: false,
+      frames: 0,
+      stopped: false
+    };
+    try {
+      await new Promise((resolve) => {
+        let settled = false;
+        let silence;
+        let limit;
+        const finish = () => {
+          if (settled)
+            return;
+          settled = true;
+          if (silence !== undefined)
+            clearTimeout(silence);
+          if (limit !== undefined)
+            clearTimeout(limit);
+          worker.removeEventListener("message", onMessage);
+          worker.removeEventListener("error", onError);
+          resolve();
+        };
+        const stopNow = () => {
+          collected.status = "stopped";
+          collected.stopped = true;
+          worker.terminate();
+          finish();
+        };
+        const arm = () => {
+          if (settled)
+            return;
+          if (silence !== undefined)
+            clearTimeout(silence);
+          silence = setTimeout(stopNow, SILENCE_MS2);
+        };
+        const onMessage = (event) => {
+          const data = asRecord(event.data);
+          if (data === undefined || typeof data.type !== "string")
+            return;
+          if (data.type === "preview-loaded") {
+            arm();
+            return;
+          }
+          if (data.type === "preview-info") {
+            collected.describePresent = data["describe"] === true;
+            collected.drawPresent = data["draw"] === true;
+            arm();
+            return;
+          }
+          if (data.type === "preview-nothing") {
+            collected.nothing = true;
+            finish();
+            return;
+          }
+          if (data.type === "preview-done") {
+            finish();
+            return;
+          }
+          if (data.type === "preview-describe") {
+            collected.describePresent = true;
+            const text = recordOf(data["text"], 2000);
+            if (text === undefined)
+              collected.describeError = "describe() の戻り値を文字にできません";
+            else
+              collected.describeText = text;
+            arm();
+            return;
+          }
+          if (data.type === "preview-tick") {
+            const frames = data["frames"];
+            if (typeof frames === "number")
+              collected.frames = frames;
+            arm();
+            return;
+          }
+          if (data.type === "preview-frames") {
+            const frames = data["frames"];
+            if (typeof frames === "number")
+              collected.frames = frames;
+            collected.drawPresent = true;
+            finish();
+            return;
+          }
+          if (data.type === "preview-unsupported") {
+            collected.drawPresent = true;
+            collected.drawUnsupported = recordOf(data["detail"], 300) ?? "この環境では描けません";
+            finish();
+            return;
+          }
+          if (data.type === "preview-error") {
+            const detail = recordOf(data["detail"], 300) ?? "失敗しました";
+            const phase = data["phase"];
+            collected.status = "error";
+            if (phase === "load")
+              collected.loadError = detail;
+            else if (phase === "describe")
+              collected.describeError = detail;
+            else {
+              collected.drawPresent = true;
+              collected.drawError = detail;
+            }
+            finish();
+          }
+        };
+        const onError = (event) => {
+          const detail = event.message === "" ? "Worker が止まった" : event.message;
+          collected.status = "error";
+          collected.loadError = detail.slice(0, 300);
+          finish();
+        };
+        active = { stop: stopNow };
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+        arm();
+        limit = setTimeout(stopNow, HARD_LIMIT_MS);
+        worker.postMessage({ type: "boot", urls: table.urls, entry: name, canvas: offscreen }, offscreen === null ? [] : [offscreen]);
+      });
+    } catch (error) {
+      collected.status = "error";
+      collected.loadError = describeError(error).slice(0, 300);
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      revokeAll(table.created);
+      active = undefined;
+    }
+    return {
+      status: collected.status,
+      describePresent: collected.describePresent,
+      describeText: collected.describeText ?? null,
+      describeError: collected.describeError ?? null,
+      nothing: collected.nothing,
+      drawPresent: collected.drawPresent,
+      frames: collected.frames,
+      drawError: collected.drawError ?? null,
+      drawUnsupported: collected.drawUnsupported ?? null,
+      loadError: collected.loadError ?? null,
+      stopped: collected.stopped,
+      elapsedMs: round1(performance.now() - started)
+    };
+  };
+
   // src/frame/jobs/probe.ts
   var PROBE_TIMEOUT_MS = 1e4;
   var workerEnvJob = async () => {
@@ -1031,15 +1504,15 @@ post({ type: "scene-loaded", revision: THREE.REVISION });
   var PROBE_TIMEOUT_MS2 = 12000;
   var LOAD_TIMEOUT_MS2 = 12000;
   var RENDER_TIMEOUT_MS = 13000;
-  var CANVAS_WIDTH = 320;
-  var CANVAS_HEIGHT = 200;
+  var CANVAS_WIDTH2 = 320;
+  var CANVAS_HEIGHT2 = 200;
   var keptWorkers = [];
   var createVisibleCanvas = () => {
     const canvas = document.createElement("canvas");
-    canvas.width = CANVAS_WIDTH;
-    canvas.height = CANVAS_HEIGHT;
-    canvas.style.width = `${CANVAS_WIDTH}px`;
-    canvas.style.height = `${CANVAS_HEIGHT}px`;
+    canvas.width = CANVAS_WIDTH2;
+    canvas.height = CANVAS_HEIGHT2;
+    canvas.style.width = `${CANVAS_WIDTH2}px`;
+    canvas.style.height = `${CANVAS_HEIGHT2}px`;
     canvas.style.display = "block";
     canvas.style.margin = "8px auto";
     document.body.append(canvas);
@@ -1131,159 +1604,6 @@ post({ type: "scene-loaded", revision: THREE.REVISION });
     }
   };
 
-  // src/frame/workers/chaos.ts
-  var SPIN_SOURCE = `${LOCK_CODE}
-try {
-  hideEntryPoints();
-  self.postMessage({ type: "spin-started" });
-} catch (error) {
-  self.postMessage({ type: "spin-error", detail: describe(error) });
-}
-for (;;) {}
-`;
-  var ECHO_SOURCE = `${LOCK_CODE}
-try {
-  hideEntryPoints();
-  self.postMessage({ type: "echo-ready", value: 1 + 1 });
-} catch (error) {
-  self.postMessage({ type: "echo-error", detail: describe(error) });
-}
-`;
-  var FLOOD_SOURCE = `${LOCK_CODE}
-try {
-  hideEntryPoints();
-} catch (error) {
-  self.postMessage({ type: "flood-error", detail: describe(error) });
-}
-const chunk = "x".repeat(1024);
-for (let index = 0; index < 20000; index += 1) {
-  self.postMessage({ type: "flood", data: chunk });
-}
-self.postMessage({ type: "flood-done", count: 20000 });
-`;
-
-  // src/frame/jobs/watch.ts
-  var SILENCE_MS = 1000;
-  var ECHO_TIMEOUT_MS = 3000;
-  var FLOOD_WINDOW_MS = 1000;
-  var FLOOD_LIMIT = 1000;
-  var FLOOD_MAX_MS = 1e4;
-  var waitForSilence = (worker, silenceMs, onSilent) => new Promise((resolve) => {
-    let timer;
-    let settled = false;
-    const finish = () => {
-      if (settled)
-        return;
-      settled = true;
-      if (timer !== undefined)
-        clearTimeout(timer);
-      worker.removeEventListener("message", onMessage);
-      worker.removeEventListener("error", onError);
-      onSilent();
-      resolve();
-    };
-    const arm = () => {
-      if (settled)
-        return;
-      if (timer !== undefined)
-        clearTimeout(timer);
-      timer = setTimeout(finish, silenceMs);
-    };
-    const onMessage = () => arm();
-    const onError = () => finish();
-    worker.addEventListener("message", onMessage);
-    worker.addEventListener("error", onError);
-    arm();
-  });
-  var spinJob = async () => {
-    const started = performance.now();
-    let terminateMs = 0;
-    const spin = createWorker(SPIN_SOURCE);
-    try {
-      await waitForSilence(spin.worker, SILENCE_MS, () => {
-        terminateMs = round1(performance.now() - started);
-        spin.worker.terminate();
-      });
-    } finally {
-      spin.worker.terminate();
-      URL.revokeObjectURL(spin.url);
-    }
-    const echoStarted = performance.now();
-    const echo = createWorker(ECHO_SOURCE);
-    try {
-      const outcome = await waitForMessage(echo.worker, ["echo-ready"], ECHO_TIMEOUT_MS);
-      const value = outcome.kind === "message" ? outcome.data.value : undefined;
-      return {
-        stopped: terminateMs > 0,
-        terminateMs,
-        silenceMs: SILENCE_MS,
-        echoOk: value === 2,
-        echoValue: typeof value === "number" ? value : null,
-        echoMs: round1(performance.now() - echoStarted)
-      };
-    } finally {
-      echo.worker.terminate();
-      URL.revokeObjectURL(echo.url);
-    }
-  };
-  var floodJob = async () => {
-    const { worker, url } = createWorker(FLOOD_SOURCE);
-    const started = performance.now();
-    const times = [];
-    let received = 0;
-    let reason = "time";
-    let stoppedMs = 0;
-    try {
-      await new Promise((resolve) => {
-        let settled = false;
-        const finish = (next) => {
-          if (settled)
-            return;
-          settled = true;
-          reason = next;
-          stoppedMs = round1(performance.now() - started);
-          clearTimeout(timer);
-          worker.terminate();
-          resolve();
-        };
-        const timer = setTimeout(() => finish("time"), FLOOD_MAX_MS);
-        worker.addEventListener("message", (event) => {
-          const data = asRecord(event.data);
-          if (data === undefined)
-            return;
-          if (data.type === "flood") {
-            received += 1;
-            const now = performance.now();
-            times.push(now);
-            while (times.length > 0) {
-              const oldest = times[0];
-              if (oldest === undefined || now - oldest < FLOOD_WINDOW_MS)
-                break;
-              times.shift();
-            }
-            if (times.length > FLOOD_LIMIT)
-              finish("limit");
-            return;
-          }
-          if (data.type === "flood-done")
-            finish("done");
-        });
-        worker.addEventListener("error", () => finish("error"));
-      });
-    } finally {
-      worker.terminate();
-      URL.revokeObjectURL(url);
-    }
-    return {
-      stopped: reason === "limit",
-      reason,
-      received,
-      limitMs: stoppedMs,
-      windowMs: FLOOD_WINDOW_MS,
-      limit: FLOOD_LIMIT
-    };
-  };
-
   // src/frame/bridge.ts
   var frameEnv = () => ({
     origin: window.origin,
@@ -1313,6 +1633,10 @@ self.postMessage({ type: "flood-done", count: 20000 });
       return await renderTransferJob();
     if (method === "render-three")
       return await renderThreeJob(params);
+    if (method === "preview-run")
+      return await previewRunJob(params);
+    if (method === "preview-stop")
+      return previewStopJob();
     throw new Error(`知らない操作: ${method}`);
   };
   var onPort = (event) => {
