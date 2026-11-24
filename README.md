@@ -1,2 +1,26 @@
-# jam-rooms.github.io
-Temporary test page. Work in progress.
+# 閲覧ページ
+
+このディレクトリは、閲覧ページとして配るファイル一式です。ビルドの結果をそのまま置く場所で、手で直すことはありません（`packages/viewer/static/` と `packages/viewer/src/` を直し、組み立て直します）。
+
+## 置くファイル
+
+- `index.html` — 外側のページ。住所に応じた画面を出します
+- `frame.html` — 隔離した枠の文書。橋渡しのコードを埋め込んであり、外部のファイルを読みません
+- `viewer.js` — 外側のページのスクリプト
+- `style.css` — 外側のページの見た目
+- `.nojekyll` — GitHub Pages に、そのままのファイルを配らせるための空のファイル
+- `README.md` — この説明
+
+この 6 つ以外のファイルを置かないでください。試験用のページや、組み立ての中間物を混ぜません。
+
+## 守っていること
+
+- 応答ヘッダに頼りません。CSP は、どちらの HTML にも `<meta>` で書いてあります。
+- 外部のスクリプト、画像、フォントを読みません。
+- 訪問者のコードは、`sandbox="allow-scripts"` の枠の中の Worker でだけ動きます。
+- 枠の文書の CSP に `'self'` は入れません。入れると、Worker からこの置き場の URL を読めてしまいます。
+- 部屋から来た文字は、文字としてだけ表示します。リンクにも要素にもしません。
+
+## 直したときは
+
+`packages/viewer` で `bun run build` を実行すると、`dist/` に同じ 6 つを作り直します。`bun test packages/viewer` が、CSP と、配る物の中身を確かめます。
