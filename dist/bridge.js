@@ -415,6 +415,200 @@ try {
     }
   };
 
+  // src/frame/workers/net.ts
+  var netProbeSource = (id, target, moduleUrl, viewerUrl) => `${LOCK_CODE}
+const probeId = ${JSON.stringify(id)};
+const target = ${JSON.stringify(target)};
+const moduleUrl = ${JSON.stringify(moduleUrl)};
+const viewerUrl = ${JSON.stringify(viewerUrl)};
+const post = (value) => self.postMessage({ type: "net-result", value: value });
+const blocked = (error) => ({ reached: false, detail: "拒否: " + describe(error) });
+
+const fetchProbe = async (init) => {
+  if (typeof fetch !== "function") return { reached: false, detail: "fetch が無い" };
+  try {
+    const response = await fetch(target, init);
+    return { reached: true, detail: "届いた status=" + response.status + " type=" + response.type };
+  } catch (error) {
+    return blocked(error);
+  }
+};
+
+const xhrProbe = () =>
+  new Promise((resolve) => {
+    if (typeof XMLHttpRequest === "undefined") {
+      resolve({ reached: false, detail: "XMLHttpRequest が無い" });
+      return;
+    }
+    try {
+      const request = new XMLHttpRequest();
+      request.open("GET", target);
+      request.onload = () => resolve({ reached: true, detail: "届いた status=" + request.status });
+      request.onerror = () => resolve({ reached: false, detail: "error イベント" });
+      request.onabort = () => resolve({ reached: false, detail: "abort イベント" });
+      request.send();
+    } catch (error) {
+      resolve(blocked(error));
+    }
+  });
+
+const importProbe = async (url) => {
+  try {
+    const namespace = await import(url);
+    const names = namespace ? Object.getOwnPropertyNames(namespace) : [];
+    return { reached: true, detail: "読めた exports=" + names.join(",") };
+  } catch (error) {
+    return blocked(error);
+  }
+};
+
+const importScriptsProbe = () => {
+  if (typeof self.importScripts !== "function") {
+    return { reached: false, detail: "importScripts が無い" };
+  }
+  try {
+    self.importScripts(target);
+    return { reached: true, detail: "実行できた" };
+  } catch (error) {
+    return blocked(error);
+  }
+};
+
+const workerProbe = () => {
+  const created = [];
+  for (const name of ["Worker", "SharedWorker"]) {
+    const Constructor = self[name];
+    if (typeof Constructor !== "function") continue;
+    try {
+      const made = new Constructor(moduleUrl);
+      created.push(name);
+      if (made && typeof made.terminate === "function") made.terminate();
+      if (made && made.port && typeof made.port.close === "function") made.port.close();
+    } catch (error) {
+      created.push(name + "=例外");
+    }
+  }
+  return {
+    reached: created.length > 0,
+    detail:
+      "Worker=" + typeof self.Worker +
+      " SharedWorker=" + typeof self.SharedWorker +
+      " 作れた=" + (created.join(",") || "なし")
+  };
+};
+
+const websocketProbe = () =>
+  new Promise((resolve) => {
+    if (typeof WebSocket === "undefined") {
+      resolve({ reached: false, opened: false, detail: "WebSocket が無い" });
+      return;
+    }
+    try {
+      const socket = new WebSocket("wss://" + new URL(target).host + "/");
+      socket.onopen = () => {
+        resolve({ reached: true, opened: true, detail: "open した" });
+        socket.close();
+      };
+      socket.onerror = () => resolve({ reached: false, opened: false, detail: "error イベント" });
+      socket.onclose = () => resolve({ reached: false, opened: false, detail: "close イベント" });
+    } catch (error) {
+      resolve({ reached: false, opened: false, detail: "拒否: " + describe(error) });
+    }
+  });
+
+const eventsourceProbe = () =>
+  new Promise((resolve) => {
+    if (typeof EventSource === "undefined") {
+      resolve({ reached: false, opened: false, detail: "EventSource が無い" });
+      return;
+    }
+    try {
+      const source = new EventSource(target);
+      source.onopen = () => {
+        resolve({ reached: true, opened: true, detail: "open した" });
+        source.close();
+      };
+      source.onerror = () => resolve({ reached: false, opened: false, detail: "error イベント" });
+    } catch (error) {
+      resolve({ reached: false, opened: false, detail: "拒否: " + describe(error) });
+    }
+  });
+
+const beaconProbe = () => {
+  const navigatorLike = self.navigator;
+  if (!navigatorLike || typeof navigatorLike.sendBeacon !== "function") {
+    return { reached: false, present: false, detail: "sendBeacon が無い" };
+  }
+  try {
+    const returned = navigatorLike.sendBeacon(target, "probe");
+    return {
+      reached: returned === true,
+      present: true,
+      returned: returned === true,
+      detail: "sendBeacon の戻り=" + String(returned)
+    };
+  } catch (error) {
+    return { reached: false, present: true, detail: "sendBeacon で例外: " + describe(error) };
+  }
+};
+
+const run = async () => {
+  if (probeId === "s2-fetch-cors") return fetchProbe({ mode: "cors" });
+  if (probeId === "s2-fetch-nocors") return fetchProbe({ mode: "no-cors" });
+  if (probeId === "s2-xhr") return xhrProbe();
+  if (probeId === "s2-import-room") return importProbe(moduleUrl);
+  if (probeId === "s2-import-viewer") return importProbe(viewerUrl);
+  if (probeId === "s2-importscripts") return importScriptsProbe();
+  if (probeId === "s2-worker") return workerProbe();
+  if (probeId === "s2-websocket") return websocketProbe();
+  if (probeId === "s2-eventsource") return eventsourceProbe();
+  if (probeId === "s2-beacon") return beaconProbe();
+  return { reached: false, detail: "知らない probe: " + probeId };
+};
+
+(async () => {
+  try {
+    const hidden = hideEntryPoints();
+    const value = Object.assign({ id: probeId }, await run(), { hidden: hidden.length });
+    post(value);
+  } catch (error) {
+    post({ id: probeId, reached: false, failed: true, detail: describe(error) });
+  }
+})();
+`;
+
+  // src/frame/jobs/net.ts
+  var NET_TIMEOUT_MS = 5000;
+  var requiredText = (record, key) => {
+    const value = record[key];
+    if (typeof value !== "string" || value === "")
+      throw new Error(`${key} が文字列でない`);
+    return value;
+  };
+  var netProbeJob = async (params) => {
+    const record = asRecord(params);
+    if (record === undefined)
+      throw new Error("params がオブジェクトでない");
+    const id = requiredText(record, "id");
+    const target = requiredText(record, "target");
+    const moduleUrl = requiredText(record, "moduleUrl");
+    const viewerUrl = requiredText(record, "viewerUrl");
+    const { worker, url } = createWorker(netProbeSource(id, target, moduleUrl, viewerUrl));
+    try {
+      const outcome = await waitForMessage(worker, ["net-result"], NET_TIMEOUT_MS);
+      if (outcome.kind === "message") {
+        return asRecord(outcome.data.value) ?? { reached: false, detail: "probe の値が無い" };
+      }
+      if (outcome.kind === "error") {
+        return { status: "worker-error", reached: false, detail: outcomeDetail(outcome) };
+      }
+      return { status: "timeout", reached: false, detail: "5秒で決着しなかった" };
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    }
+  };
+
   // src/frame/jobs/probe.ts
   var PROBE_TIMEOUT_MS = 1e4;
   var workerEnvJob = async () => {
@@ -423,6 +617,203 @@ try {
       const outcome = await waitForMessage(worker, ["worker-env"], PROBE_TIMEOUT_MS);
       if (outcome.kind === "message")
         return asRecord(outcome.data.value) ?? {};
+      throw new Error(outcomeDetail(outcome));
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  // src/frame/workers/recover.ts
+  var ATTEMPTS = `
+(async () => {
+const results = [];
+const attempt = async (group, label, fn) => {
+  let status = "info";
+  let detail = "";
+  try {
+    const outcome = await fn();
+    status = outcome.status;
+    detail = outcome.detail;
+  } catch (error) {
+    status = "blocked";
+    detail = describe(error);
+  }
+  results.push({
+    group: group,
+    label: label,
+    status: status,
+    detail: String(detail).slice(0, 300)
+  });
+};
+const kind = (value) => typeof value;
+const text = (value) => String(value).slice(0, 80);
+const raceMs = (promise, ms) =>
+  Promise.race([
+    promise.then(
+      (value) => ({ ok: true, value: value }),
+      (error) => ({ ok: false, error: error })
+    ),
+    new Promise((resolve) =>
+      setTimeout(() => resolve({ ok: false, error: { name: "Timeout", message: ms + "ms" } }), ms)
+    )
+  ]);
+
+const hidden = hideEntryPoints();
+
+await attempt("worker", "self.Worker", () => ({
+  status: self.Worker === undefined ? "absent" : "recovered",
+  detail: kind(self.Worker) + " " + text(self.Worker)
+}));
+await attempt("worker", "globalThis.Worker", () => ({
+  status: globalThis.Worker === undefined ? "absent" : "recovered",
+  detail: kind(globalThis.Worker)
+}));
+await attempt("worker", "Object.getPrototypeOf(self).Worker", () => {
+  const proto = Object.getPrototypeOf(self);
+  return {
+    status: proto.Worker === undefined ? "absent" : "recovered",
+    detail: kind(proto.Worker)
+  };
+});
+await attempt("worker", "self.constructor.prototype.Worker", () => {
+  const proto = self.constructor && self.constructor.prototype;
+  if (!proto) return { status: "absent", detail: "constructor 無し" };
+  return {
+    status: proto.Worker === undefined ? "absent" : "recovered",
+    detail: kind(proto.Worker)
+  };
+});
+await attempt("worker", "self.SharedWorker", () => ({
+  status: self.SharedWorker === undefined ? "absent" : "recovered",
+  detail: kind(self.SharedWorker)
+}));
+await attempt("worker", "new DedicatedWorkerGlobalScope()", () => {
+  if (typeof DedicatedWorkerGlobalScope === "undefined") {
+    return { status: "absent", detail: "DedicatedWorkerGlobalScope が無い" };
+  }
+  try {
+    const made = new DedicatedWorkerGlobalScope();
+    return { status: "recovered", detail: "作れてしまった: " + kind(made) };
+  } catch (error) {
+    return { status: "blocked", detail: describe(error) };
+  }
+});
+await attempt("worker", "Reflect.construct(self.constructor, [])", () => {
+  const made = Reflect.construct(self.constructor, []);
+  return { status: "recovered", detail: "作れてしまった: " + kind(made) };
+});
+await attempt("worker", "プロトタイプをたどって Worker を探す", () => {
+  const names = [];
+  let cursor = self;
+  let depth = 0;
+  while (cursor !== null && depth < 8) {
+    for (const name of Object.getOwnPropertyNames(cursor)) names.push(name);
+    cursor = Object.getPrototypeOf(cursor);
+    depth += 1;
+  }
+  const hits = names.filter((name) => name.toLowerCase().indexOf("worker") >= 0);
+  return { status: "info", detail: "見つかった名前=" + JSON.stringify(hits) };
+});
+
+await attempt("code", "URL.createObjectURL", () => ({
+  status: URL.createObjectURL === undefined ? "absent" : "recovered",
+  detail: kind(URL.createObjectURL)
+}));
+await attempt("code", "self.URL.createObjectURL", () => ({
+  status: self.URL.createObjectURL === undefined ? "absent" : "recovered",
+  detail: kind(self.URL.createObjectURL)
+}));
+await attempt("code", "self.webkitURL.createObjectURL", () => {
+  const webkit = self.webkitURL;
+  if (!webkit) return { status: "absent", detail: "webkitURL 無し" };
+  return {
+    status: webkit.createObjectURL === undefined ? "absent" : "recovered",
+    detail: kind(webkit.createObjectURL)
+  };
+});
+await attempt("code", "new URL(...).constructor.createObjectURL", () => {
+  const made = new URL("https://x.invalid/");
+  return {
+    status: made.constructor.createObjectURL === undefined ? "absent" : "recovered",
+    detail: kind(made.constructor.createObjectURL)
+  };
+});
+await attempt("code", "Object.getOwnPropertyNames(URL)", () => ({
+  status: "info",
+  detail: JSON.stringify(Object.getOwnPropertyNames(URL))
+}));
+await attempt("code", "importScripts の型", () => ({
+  status: self.importScripts === undefined ? "absent" : "recovered",
+  detail: kind(self.importScripts)
+}));
+await attempt("code", "importScripts(data:)", () => {
+  if (typeof self.importScripts !== "function") {
+    return { status: "absent", detail: "importScripts が無い" };
+  }
+  self.importScripts("data:text/javascript,self.__importScriptsRan=1");
+  return { status: "recovered", detail: "ran=" + String(self.__importScriptsRan) };
+});
+await attempt("code", 'eval("1")', () => ({
+  status: "recovered",
+  detail: "value=" + String(eval("1"))
+}));
+await attempt("code", 'new Function("return 1")()', () => ({
+  status: "recovered",
+  detail: "value=" + String(new Function("return 1")())
+}));
+await attempt("code", 'import("data:text/javascript,export default 1")', async () => {
+  const module = await import("data:text/javascript,export default 1");
+  return { status: "recovered", detail: "default=" + String(module.default) };
+});
+await attempt("code", "import(Blob をそのまま)", async () => {
+  const blob = new Blob(["export default 7;"], { type: "text/javascript" });
+  const module = await import(blob);
+  return { status: "recovered", detail: "default=" + String(module.default) };
+});
+await attempt("code", "FileReaderSync の型", () => ({
+  status: typeof FileReaderSync === "undefined" ? "absent" : "info",
+  detail: kind(FileReaderSync)
+}));
+await attempt("code", "FileReaderSync -> data URL -> import", async () => {
+  if (typeof FileReaderSync === "undefined") return { status: "absent", detail: "FileReaderSync 無し" };
+  const reader = new FileReaderSync();
+  const dataUrl = reader.readAsDataURL(new Blob(["export default 3;"], { type: "text/javascript" }));
+  const module = await import(dataUrl);
+  return { status: "recovered", detail: "default=" + String(module.default) };
+});
+await attempt("worker", "navigator.serviceWorker.register", async () => {
+  const container = navigator.serviceWorker;
+  if (!container) return { status: "absent", detail: "serviceWorker 無し" };
+  const registered = await raceMs(container.register(String(self.location.href)), 1500);
+  return {
+    status: registered.ok ? "recovered" : "blocked",
+    detail: registered.ok ? "登録できた" : describe(registered.error)
+  };
+});
+
+self.postMessage({
+  type: "recover-result",
+  value: { hidden: hidden.length, attempts: results }
+});
+})().catch((error) => {
+  self.postMessage({ type: "recover-error", detail: describe(error) });
+});
+`;
+  var RECOVER_SOURCE = `${LOCK_CODE}${ATTEMPTS}`;
+
+  // src/frame/jobs/recover.ts
+  var RECOVER_TIMEOUT_MS = 20000;
+  var recoverJob = async () => {
+    const { worker, url } = createWorker(RECOVER_SOURCE);
+    try {
+      const outcome = await waitForMessage(worker, ["recover-result", "recover-error"], RECOVER_TIMEOUT_MS);
+      if (outcome.kind === "message" && outcome.type === "recover-result") {
+        return asRecord(outcome.data.value) ?? { attempts: [] };
+      }
+      if (outcome.kind === "message") {
+        throw new Error(textField(outcome.data, "detail") || "取り戻しの試験が失敗した");
+      }
       throw new Error(outcomeDetail(outcome));
     } finally {
       worker.terminate();
@@ -740,6 +1131,159 @@ post({ type: "scene-loaded", revision: THREE.REVISION });
     }
   };
 
+  // src/frame/workers/chaos.ts
+  var SPIN_SOURCE = `${LOCK_CODE}
+try {
+  hideEntryPoints();
+  self.postMessage({ type: "spin-started" });
+} catch (error) {
+  self.postMessage({ type: "spin-error", detail: describe(error) });
+}
+for (;;) {}
+`;
+  var ECHO_SOURCE = `${LOCK_CODE}
+try {
+  hideEntryPoints();
+  self.postMessage({ type: "echo-ready", value: 1 + 1 });
+} catch (error) {
+  self.postMessage({ type: "echo-error", detail: describe(error) });
+}
+`;
+  var FLOOD_SOURCE = `${LOCK_CODE}
+try {
+  hideEntryPoints();
+} catch (error) {
+  self.postMessage({ type: "flood-error", detail: describe(error) });
+}
+const chunk = "x".repeat(1024);
+for (let index = 0; index < 20000; index += 1) {
+  self.postMessage({ type: "flood", data: chunk });
+}
+self.postMessage({ type: "flood-done", count: 20000 });
+`;
+
+  // src/frame/jobs/watch.ts
+  var SILENCE_MS = 1000;
+  var ECHO_TIMEOUT_MS = 3000;
+  var FLOOD_WINDOW_MS = 1000;
+  var FLOOD_LIMIT = 1000;
+  var FLOOD_MAX_MS = 1e4;
+  var waitForSilence = (worker, silenceMs, onSilent) => new Promise((resolve) => {
+    let timer;
+    let settled = false;
+    const finish = () => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== undefined)
+        clearTimeout(timer);
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      onSilent();
+      resolve();
+    };
+    const arm = () => {
+      if (settled)
+        return;
+      if (timer !== undefined)
+        clearTimeout(timer);
+      timer = setTimeout(finish, silenceMs);
+    };
+    const onMessage = () => arm();
+    const onError = () => finish();
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    arm();
+  });
+  var spinJob = async () => {
+    const started = performance.now();
+    let terminateMs = 0;
+    const spin = createWorker(SPIN_SOURCE);
+    try {
+      await waitForSilence(spin.worker, SILENCE_MS, () => {
+        terminateMs = round1(performance.now() - started);
+        spin.worker.terminate();
+      });
+    } finally {
+      spin.worker.terminate();
+      URL.revokeObjectURL(spin.url);
+    }
+    const echoStarted = performance.now();
+    const echo = createWorker(ECHO_SOURCE);
+    try {
+      const outcome = await waitForMessage(echo.worker, ["echo-ready"], ECHO_TIMEOUT_MS);
+      const value = outcome.kind === "message" ? outcome.data.value : undefined;
+      return {
+        stopped: terminateMs > 0,
+        terminateMs,
+        silenceMs: SILENCE_MS,
+        echoOk: value === 2,
+        echoValue: typeof value === "number" ? value : null,
+        echoMs: round1(performance.now() - echoStarted)
+      };
+    } finally {
+      echo.worker.terminate();
+      URL.revokeObjectURL(echo.url);
+    }
+  };
+  var floodJob = async () => {
+    const { worker, url } = createWorker(FLOOD_SOURCE);
+    const started = performance.now();
+    const times = [];
+    let received = 0;
+    let reason = "time";
+    let stoppedMs = 0;
+    try {
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = (next) => {
+          if (settled)
+            return;
+          settled = true;
+          reason = next;
+          stoppedMs = round1(performance.now() - started);
+          clearTimeout(timer);
+          worker.terminate();
+          resolve();
+        };
+        const timer = setTimeout(() => finish("time"), FLOOD_MAX_MS);
+        worker.addEventListener("message", (event) => {
+          const data = asRecord(event.data);
+          if (data === undefined)
+            return;
+          if (data.type === "flood") {
+            received += 1;
+            const now = performance.now();
+            times.push(now);
+            while (times.length > 0) {
+              const oldest = times[0];
+              if (oldest === undefined || now - oldest < FLOOD_WINDOW_MS)
+                break;
+              times.shift();
+            }
+            if (times.length > FLOOD_LIMIT)
+              finish("limit");
+            return;
+          }
+          if (data.type === "flood-done")
+            finish("done");
+        });
+        worker.addEventListener("error", () => finish("error"));
+      });
+    } finally {
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    }
+    return {
+      stopped: reason === "limit",
+      reason,
+      received,
+      limitMs: stoppedMs,
+      windowMs: FLOOD_WINDOW_MS,
+      limit: FLOOD_LIMIT
+    };
+  };
+
   // src/frame/bridge.ts
   var frameEnv = () => ({
     origin: window.origin,
@@ -753,6 +1297,14 @@ post({ type: "scene-loaded", revision: THREE.REVISION });
       return await workerEnvJob();
     if (method === "load")
       return await loadJob(params);
+    if (method === "net-probe")
+      return await netProbeJob(params);
+    if (method === "recover")
+      return await recoverJob();
+    if (method === "spin")
+      return await spinJob();
+    if (method === "flood")
+      return await floodJob();
     if (method === "render-2d")
       return await renderProbeJob("2d");
     if (method === "render-webgl2")
@@ -775,6 +1327,17 @@ post({ type: "scene-loaded", revision: THREE.REVISION });
     window.removeEventListener("message", onPort);
     createRpc(port, handle);
   };
-  window.addEventListener("message", onPort);
-  window.parent.postMessage({ type: "ready" }, "*");
+  var isIsolated = () => self.origin === "null" && window.parent !== window;
+  var refuse = () => {
+    document.body.textContent = "隔離されていないので動きません";
+    if (window.parent !== window)
+      window.parent.postMessage({ type: "refused" }, "*");
+  };
+  if (isIsolated()) {
+    Reflect.set(window, "__bridgeStarted", true);
+    window.addEventListener("message", onPort);
+    window.parent.postMessage({ type: "ready" }, "*");
+  } else {
+    refuse();
+  }
 })();
