@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src https:; frame-src 'self'; base-uri 'none'; form-action 'none'">
+<title>jamroom pages-viewer（第1部）</title>
+<link rel="icon" href="data:,">
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: #0e1116; color: #e8eaed;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+h1 { font-size: clamp(16px, 4vw, 22px); margin: 0 0 8px; font-weight: 600; }
+h2 { font-size: 14px; margin: 20px 0 6px; color: #9aa4b2; }
+.big { font-size: clamp(26px, 8vw, 44px); font-weight: 700; line-height: 1.2; margin: 8px 0 12px; }
+.big[data-tone="ok"] { color: #4ade80; }
+.big[data-tone="bad"] { color: #f87171; }
+.problems p { color: #fbbf24; margin: 4px 0; font-size: 13px; }
+.frame-host iframe { width: 100%; height: min(95vw, 470px); border: 1px solid #2a2f3a;
+  border-radius: 8px; background: #fff; }
+.table-wrap { overflow-x: auto; margin-top: 16px; }
+table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 12px; }
+th, td { border-bottom: 1px solid #252a34; padding: 5px 6px; text-align: left; vertical-align: top; }
+th { color: #9aa4b2; font-weight: 600; position: sticky; top: 0; background: #0e1116; }
+tr[data-verdict="pass"] td:nth-child(5) { color: #4ade80; }
+tr[data-verdict="FAIL"] td:nth-child(5), tr[data-verdict="error"] td:nth-child(5) { color: #f87171; }
+tr[data-verdict="info"] td:nth-child(5) { color: #93c5fd; }
+pre { white-space: pre-wrap; word-break: break-word; background: #151a22; padding: 10px;
+  border-radius: 8px; font-size: 12px; }
+textarea { width: 100%; height: 260px; background: #151a22; color: #d7dce3;
+  border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+<h1>jamroom pages-viewer（第1部）</h1>
+<div id="status" class="big" data-tone="idle">準備中</div>
+<div id="problems" class="problems"></div>
+</header>
+<div id="frame-host" class="frame-host"></div>
+<div class="table-wrap">
+<table>
+<thead><tr><th>節</th><th>id</th><th>部屋</th><th>期待</th><th>結果</th><th>説明</th><th>ms</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+</div>
+<h2>まとめ</h2>
+<pre id="failures"></pre>
+<pre id="notes"></pre>
+<h2>全結果の JSON</h2>
+<textarea id="json" readonly></textarea>
+<script src="dist/outer.js"></script>
+</body>
+</html>
