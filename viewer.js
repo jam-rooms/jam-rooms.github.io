@@ -1,4 +1,6 @@
+"use strict";
 (() => {
+
   var ok = (value) => ({ ok: true, value });
   var fail = (code, detail) => detail === undefined ? { ok: false, code } : { ok: false, code, detail };
   var isRecord = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -10,7 +12,7 @@
     return true;
   };
 
-  var NAME_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
+  var NAME_PATTERN = /^(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$)[a-z][a-z0-9-]{0,39}$/;
   var SHA256_PATTERN = /^[0-9a-f]{64}$/;
   var FLOORS = {
     codeChars: 48000,
@@ -413,10 +415,23 @@ ${code}`);
   };
   var BOT_LOGIN = "github-actions[bot]";
   var pickBotMarker = (comments) => {
-    const last = comments.findLast((comment) => comment.user !== null && comment.user.login === BOT_LOGIN && comment.user.type === "Bot");
-    if (last === undefined || last.body === null)
-      return null;
-    return parseMarker(last.body);
+    for (let index = comments.length - 1;index >= 0; index -= 1) {
+      const comment = comments[index];
+      if (comment === undefined)
+        continue;
+      if (comment.user === null)
+        continue;
+      if (comment.user.login !== BOT_LOGIN || comment.user.type !== "Bot")
+        continue;
+      if (comment.editedByOther === true)
+        continue;
+      if (comment.body === null)
+        continue;
+      const marker = parseMarker(comment.body);
+      if (marker !== null)
+        return marker;
+    }
+    return null;
   };
   var decideVerdict = (input) => {
     if (input.state === "closed")
@@ -1050,6 +1065,7 @@ ${code}`);
     "no-start": "入口に start がありません",
     "start-error": "start が失敗しました",
     "boot-error": "起動できませんでした",
+    "canvas-too-large": "キャンバスが大きすぎるので、止めました",
     "render-stall": "描画が戻らなくなりました",
     "frame-error": "枠を用意できませんでした",
     unexpected: "予想していない問題が起きました"
@@ -1456,7 +1472,8 @@ ${code}`);
     "load-error",
     "no-start",
     "start-error",
-    "boot-error"
+    "boot-error",
+    "canvas-too-large"
   ];
   var isPlainObject = (value) => {
     if (typeof value !== "object" || value === null)

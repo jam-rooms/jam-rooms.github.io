@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; worker-src blob:; child-src blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; worker-src blob:; child-src blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; webrtc 'block'">
 <title>frame</title>
 <style>
 html, body { margin: 0; padding: 0; background: #0e1116; color: #e8eaed;
@@ -20,10 +20,12 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
 <canvas id="surface" tabindex="0"></canvas>
 <div id="output"></div>
 <script>
+"use strict";
 (() => {
+
   var ok = (value) => ({ ok: true, value });
   var fail = (code, detail) => detail === undefined ? { ok: false, code } : { ok: false, code, detail };
-  var NAME_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
+  var NAME_PATTERN = /^(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$)[a-z][a-z0-9-]{0,39}$/;
   var SHA256_PATTERN = /^[0-9a-f]{64}$/;
   var FLOORS = {
     codeChars: 48000,
@@ -601,6 +603,7 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
     let ready = false;
     let stopped = false;
     const rate = createRateLimit(FIXED.messagesPerSecond);
+    const errorRate = createRateLimit(FIXED.errorsMax);
     let statsAt = Number.NEGATIVE_INFINITY;
     let running = false;
     let errorCount = 0;
@@ -695,6 +698,16 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
         }
         return;
       }
+      let size = null;
+      try {
+        size = deps.surfaceSize();
+      } catch {
+        size = null;
+      }
+      if (size !== null && (size.width > FLOORS.canvasSize || size.height > FLOORS.canvasSize)) {
+        halt("canvas-too-large", "キャンバスが大きすぎます");
+        return;
+      }
       const late = lastTick !== null && now - lastTick >= FIXED.watchSilenceMs;
       lastTick = now;
       if (late) {
@@ -763,13 +776,16 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
       }
     };
     const onError = (event) => {
+      if (ready)
+        event.preventDefault?.();
       if (stopped)
         return;
       if (!ready) {
         halt("worker-error", "Worker が読み込みの前に止まりました");
         return;
       }
-      event.preventDefault?.();
+      if (errorRate.hit(deps.now()))
+        halt("flood", "例外の頻度が上限を超えました");
     };
     const onMessageError = () => {
       if (stopped)
@@ -901,8 +917,9 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
       canvas.height = room.height;
       try {
         session = createSession(room, {
-          workerSource: `(() => {
-  var NAME_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
+          workerSource: `"use strict";
+(() => {
+  var NAME_PATTERN = /^(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$)[a-z][a-z0-9-]{0,39}$/;
   var SHA256_PATTERN = /^[0-9a-f]{64}$/;
   var FLOORS = {
     codeChars: 48000,
@@ -1124,7 +1141,7 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
     return errorText(event, maxChars);
   };
 
-  var SCOPE_NAMES = ["Worker", "SharedWorker", "importScripts"];
+  var SCOPE_NAMES = ["Worker", "SharedWorker", "importScripts", "postMessage"];
   var URL_NAMES = ["createObjectURL", "revokeObjectURL"];
   var ALL_NAMES = [...SCOPE_NAMES, ...URL_NAMES];
   var hasOwnProperty = Object.prototype.hasOwnProperty;
@@ -1216,6 +1233,59 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
     if (webkit !== null)
       note(webkit);
     return Object.freeze(remaining);
+  };
+
+  var ERROR_CHARS = FIXED.errorChars;
+  var TEXT_CHARS = FIXED.textCharsPerCall;
+  var MAX_SAFE = 9007199254740991;
+  var DETAIL_UNREADABLE = "詳細を出せません";
+  var TEXT_UNREADABLE = "(文字にできない値)";
+  var isFailCode = (value) => value === "lock-failed" || value === "load-error" || value === "no-start" || value === "start-error";
+  var isCount = (value) => typeof value === "number" && value >= 0 && value <= MAX_SAFE && value % 1 === 0;
+  var isDetail = (value) => typeof value === "string" && value.length <= ERROR_CHARS;
+  var createOutbox = (send) => {
+    return (message) => {
+      try {
+        if (typeof message !== "object" || message === null)
+          return;
+        const record = message;
+        const t = record.t;
+        if (t === "ready" || t === "running") {
+          send({ t });
+          return;
+        }
+        if (t === "failed") {
+          const code = record.code;
+          if (!isFailCode(code))
+            return;
+          const detail = record.detail;
+          send({
+            t: "failed",
+            code,
+            detail: isDetail(detail) ? detail : DETAIL_UNREADABLE
+          });
+          return;
+        }
+        if (t === "error") {
+          const detail = record.detail;
+          send({ t: "error", detail: isDetail(detail) ? detail : DETAIL_UNREADABLE });
+          return;
+        }
+        if (t === "text") {
+          const s = record.s;
+          send({ t: "text", s: typeof s === "string" && s.length <= TEXT_CHARS ? s : TEXT_UNREADABLE });
+          return;
+        }
+        if (t === "pong") {
+          const n = record.n;
+          const frames = record.frames;
+          if (!isCount(n) || !isCount(frames))
+            return;
+          send({ t: "pong", n, frames });
+          return;
+        }
+      } catch {}
+    };
   };
 
   var ZERO_SEED = "0".repeat(64);
@@ -1426,122 +1496,135 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
     return { room, dispatchInput, frames };
   };
 
-  var remaining = lockDown(self, URL);
-  var scope = self;
-  var locked = remaining.length === 0;
-  var booted = false;
-  var frames = () => 0;
-  var dispatch = () => {
-    return;
+  var createPrevent = () => {
+    const call = Function.prototype.call.bind(Event.prototype.preventDefault);
+    return (event) => {
+      try {
+        call(event);
+      } catch {}
+    };
   };
-  var errorCount = 0;
-  var post = (message) => {
-    try {
-      scope.postMessage(message);
-    } catch {}
-  };
-  var report = (detail) => {
-    if (errorCount >= FIXED.errorsMax)
+  var startWorker = (scope, urlHolder) => {
+    const sendRaw = scope.postMessage.bind(scope);
+    const prevent = createPrevent();
+    const remaining = lockDown(scope, urlHolder);
+    const post = createOutbox(sendRaw);
+    const locked = remaining.length === 0;
+    let booted = false;
+    let frames = () => 0;
+    let dispatch = () => {
       return;
-    errorCount += 1;
-    post({ t: "error", detail });
-  };
-  var nextFrame = (callback) => {
-    if (typeof requestAnimationFrame === "function") {
-      requestAnimationFrame(() => {
+    };
+    let errorCount = 0;
+    const report = (detail) => {
+      if (errorCount >= FIXED.errorsMax)
+        return;
+      errorCount += 1;
+      post({ t: "error", detail });
+    };
+    const nextFrame = (callback) => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => {
+          callback(performance.now());
+        });
+        return;
+      }
+      setTimeout(() => {
         callback(performance.now());
-      });
-      return;
-    }
-    setTimeout(() => {
-      callback(performance.now());
-    }, 16);
-  };
-  var boot = async (message) => {
-    try {
-      const random = createRandom(message.seed);
-      const importUrl = async (url) => {
-        if (typeof url !== "string")
-          throw new Error("モジュールの URL が文字列ではありません");
-        return await import(url);
-      };
-      const api = createRoom({
-        urls: message.urls,
-        modules: message.modules,
-        random,
-        canvas: message.canvas,
-        importUrl,
-        post,
-        nextFrame,
-        clock: () => Date.now()
-      });
-      frames = api.frames;
-      dispatch = api.dispatchInput;
-      const room = api.room;
-      const entryUrl = message.urls[message.entry];
-      if (typeof entryUrl !== "string") {
-        const detail = errorText(\`入口の URL がありません: \${message.entry}\`, FIXED.errorChars);
-        post({ t: "failed", code: "load-error", detail });
-        return;
-      }
-      let namespace;
+      }, 16);
+    };
+    const boot = async (message) => {
       try {
-        namespace = await importUrl(entryUrl);
+        const random = createRandom(message.seed);
+        const importUrl = async (url) => {
+          if (typeof url !== "string")
+            throw new Error("モジュールの URL が文字列ではありません");
+          return await import(url);
+        };
+        const api = createRoom({
+          urls: message.urls,
+          modules: message.modules,
+          random,
+          canvas: message.canvas,
+          importUrl,
+          post,
+          nextFrame,
+          clock: () => Date.now()
+        });
+        frames = api.frames;
+        dispatch = api.dispatchInput;
+        const room = api.room;
+        const entryUrl = message.urls[message.entry];
+        if (typeof entryUrl !== "string") {
+          const detail = errorText(\`入口の URL がありません: \${message.entry}\`, FIXED.errorChars);
+          post({ t: "failed", code: "load-error", detail });
+          return;
+        }
+        let namespace;
+        try {
+          namespace = await importUrl(entryUrl);
+        } catch (error) {
+          post({ t: "failed", code: "load-error", detail: errorText(error, FIXED.errorChars) });
+          return;
+        }
+        let start;
+        try {
+          start = namespace?.start;
+        } catch (error) {
+          post({ t: "failed", code: "load-error", detail: errorText(error, FIXED.errorChars) });
+          return;
+        }
+        if (typeof start !== "function") {
+          post({ t: "failed", code: "no-start", detail: "入口に start という関数がありません" });
+          return;
+        }
+        try {
+          await start(room);
+        } catch (error) {
+          post({ t: "failed", code: "start-error", detail: errorText(error, FIXED.errorChars) });
+          return;
+        }
+        post({ t: "running" });
       } catch (error) {
         post({ t: "failed", code: "load-error", detail: errorText(error, FIXED.errorChars) });
+      }
+    };
+    const onMessage = (event) => {
+      if (event.isTrusted !== true)
+        return;
+      const message = parseHostMessage(event.data);
+      if (message === undefined)
+        return;
+      if (message.t === "ping") {
+        post({ t: "pong", n: message.n, frames: frames() });
         return;
       }
-      let start;
+      if (message.t === "input") {
+        dispatch(message.event);
+        return;
+      }
+      if (!locked || booted)
+        return;
+      booted = true;
+      boot(message);
+    };
+    const onFailure = (event) => {
+      prevent(event);
       try {
-        start = namespace?.start;
-      } catch (error) {
-        post({ t: "failed", code: "load-error", detail: errorText(error, FIXED.errorChars) });
-        return;
-      }
-      if (typeof start !== "function") {
-        post({ t: "failed", code: "no-start", detail: "入口に start という関数がありません" });
-        return;
-      }
-      try {
-        await start(room);
-      } catch (error) {
-        post({ t: "failed", code: "start-error", detail: errorText(error, FIXED.errorChars) });
-        return;
-      }
-      post({ t: "running" });
-    } catch (error) {
-      post({ t: "failed", code: "load-error", detail: errorText(error, FIXED.errorChars) });
+        report(errorEventText(event, FIXED.errorChars));
+      } catch {}
+    };
+    scope.addEventListener("message", onMessage);
+    scope.addEventListener("error", onFailure, true);
+    scope.addEventListener("unhandledrejection", onFailure, true);
+    if (locked) {
+      post({ t: "ready" });
+    } else {
+      post({ t: "failed", code: "lock-failed", detail: errorText(remaining.join(", "), FIXED.errorChars) });
     }
   };
-  var onMessage = (event) => {
-    const message = parseHostMessage(event.data);
-    if (message === undefined)
-      return;
-    if (message.t === "ping") {
-      post({ t: "pong", n: message.n, frames: frames() });
-      return;
-    }
-    if (message.t === "input") {
-      dispatch(message.event);
-      return;
-    }
-    if (!locked || booted)
-      return;
-    booted = true;
-    boot(message);
-  };
-  scope.addEventListener("message", onMessage);
-  scope.addEventListener("error", (event) => {
-    report(errorEventText(event, FIXED.errorChars));
-  });
-  scope.addEventListener("unhandledrejection", (event) => {
-    report(errorEventText(event, FIXED.errorChars));
-  });
-  if (locked) {
-    post({ t: "ready" });
-  } else {
-    post({ t: "failed", code: "lock-failed", detail: errorText(remaining.join(", "), FIXED.errorChars) });
-  }
+
+  startWorker(self, URL);
 })();
 `,
           makeUrl: (code) => URL.createObjectURL(new Blob([code], { type: "text/javascript" })),
@@ -1555,6 +1638,7 @@ canvas:focus-visible { outline: 2px solid #4c9aff; outline-offset: -2px; }
           },
           now: () => Date.now(),
           surface,
+          surfaceSize: () => ({ width: canvas.width, height: canvas.height }),
           nextPing,
           startTimer: (callback, intervalMs) => window.setInterval(callback, intervalMs),
           stopTimer: (handle) => {
